@@ -1,5 +1,5 @@
 ﻿# This powershell script is part of WVDAdmin and Project Hydra - see https://blog.itprocloud.de/Windows-Virtual-Desktop-Admin/ for more information
-# Current Version of this script: 10.5
+# Current Version of this script: 11.0
 param(
 	[Parameter(Mandatory)]
 	[ValidateNotNullOrEmpty()]
@@ -20,6 +20,7 @@ param(
 	[string] $DomainJoinOU = '',
 	[string] $AadOnly = '0',
 	[string] $JoinMem = '0',
+	[string] $IsHydra = '0',
 	[string] $MovePagefileToC = '0',
 	[string] $ExpandPartition = '0',
 	[string] $DomainFqdn = '',
@@ -29,9 +30,11 @@ param(
 	[string] $HydraAgentSecret = '', 					#Only used by Hydra
 	[string] $DownloadNewestAgent = '0', 				#Download the newes agent, event if a local agent exist
 	[string] $WaitForHybridJoin = '0',					#Awaits the completion of a hybrid join before joining the host pool
+	[string] $ForwardSignature64 = '',
 	[string] $parameters								#Additional parameters, e.g.: used to configure sysprep
 )
 Add-Type -AssemblyName System.ServiceProcess -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function LogWriter($message) {
 	$message = "$(Get-Date ([datetime]::UtcNow) -Format "o") $message"
@@ -51,6 +54,128 @@ function ShowPageFiles() {
 	LogWriter("Pagefiles:")
 	foreach ($pageFile in $pageFiles) {
 		LogWriter("Name: '$($pageFile.Name)', Maximum size: '$($pageFile.MaximumSize)'")
+	}
+}
+function Decrypt-String ($encryptedString, $passPhrase) {
+    try {
+        $data = [Convert]::FromBase64String($encryptedString)
+        $key  = [Convert]::FromBase64String($passPhrase)
+        $iv   = $data[0..15]
+        $ct   = $data[16..($data.Length - 1)]
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.Mode = 'CBC'; $aes.Key = $key; $aes.IV = $iv
+        $cs = New-Object System.Security.Cryptography.CryptoStream (([IO.MemoryStream]::new($ct)),$aes.CreateDecryptor(),'Read')
+        return ([IO.StreamReader]::new($cs)).ReadToEnd()
+    } catch {
+        return $encryptedString
+    }
+}
+function ChangeSignature($path)
+{
+	if (![string]::IsNullOrWhiteSpace($ForwardSignature64)) {
+		try {
+			$text = [System.IO.File]::ReadAllText($path)
+			$text = [regex]::Replace($text, '(?ms)# SIG # Begin'+' signature block.*?# SIG # End '+'signature block', '')
+			$sig = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ForwardSignature64))
+			$text = $text.TrimEnd() + "`r`n`r`n" + $sig.TrimEnd() + "`r`n"
+			$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+			[IO.File]::WriteAllText($path, $text, $utf8NoBom)
+		}
+		catch {
+			LogWriter("Signature not changed: $_")
+		}
+	}
+}
+function RemoveCryptoKey($path) {
+	LogWriter("Remove CryptoKey")
+    try {
+        (gc $path) | ForEach-Object {
+            if ($_ -like '*####CryptoKeySet####*' -and $_ -like '*$CryptoKey=*' -and ($_ -notlike '*-and*')) {
+                '#' * $_.Length
+            } else {
+                $_
+            }
+        } | sc $path -Encoding UTF8
+		$name = Split-Path $path -Leaf
+		$dir  = Split-Path $path -Parent
+		if ($path -like 'C:\Packages\Plugins\*\Downloads\*' -and $name -like 'script*.ps1') {
+			RemoveReadOnlyFromScripts $path
+			$settingsPath="$(([System.IO.DirectoryInfo]::new($path).Parent.Parent.FullName))\RuntimeSettings\$(($name -split '\.')[0] -replace '[^\d]', '').settings"
+			if (Test-Path -Path $settingsPath) {try {""|sc $settingsPath -Encoding UTF8 -ErrorAction stop} catch{}}
+		}
+		if ($path -like 'C:\Packages\Plugins\*\Downloads\*') {
+			$aclNew=New-Object Security.AccessControl.DirectorySecurity
+			$aclNew.SetSecurityDescriptorSddlForm("O:SY G:SY D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+			$aclNew.SetAccessRuleProtection($true, $false)
+			Set-Acl -Path ([System.IO.DirectoryInfo]::new($path).Parent.Parent.FullName) -AclObject $aclNew -ErrorAction Stop
+		}
+    } catch {
+		LogWriter("Remove CryptoKey cause an exception: $_")
+	}
+}
+function RemoveReadOnlyFromScripts($path){
+    try {
+		if ($path -like 'C:\Packages\Plugins\*\Downloads\*') {
+			$dir  = Split-Path $path -Parent
+			Get-ChildItem $dir -Filter 'script*.ps1' -File | ForEach-Object {
+				if ($_.Attributes -band 'ReadOnly') { $_.Attributes = $_.Attributes -bxor 'ReadOnly' }
+			}
+		}
+    } catch {
+        LogWriter("Remove ReadOnly from scripts caused an issue: $_")
+    }
+}
+function Wait-ForFileRelease ($filePath,$timeOutInSeconds) {
+    try {
+        if ((Test-Path -Path $FilePath) -and ((Get-Date) - (Get-Item -Path $FilePath).CreationTime).TotalSeconds -le 600) {
+			LogWriter("Waiting for file release - Started.")
+            $startTime = Get-Date
+            while (Test-Path -Path $FilePath) {
+                if (((Get-Date) - $startTime).TotalSeconds -gt $timeOutInSeconds) {
+                    break
+                }
+                Start-Sleep -Seconds 1
+            }
+			LogWriter("Waiting for file release - Finished.")
+        }
+        if (Test-Path -Path $FilePath) {Remove-Item -Path $FilePath -Force -ErrorAction SilentlyContinue}
+    }
+    catch {
+        LogWriter("Couldn't validate flag-file: $_")
+    }
+}
+function CleanPsLog() {
+	AddRegistyKey "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+	New-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 0 -force -ErrorAction SilentlyContinue
+    try {Disable-PSTrace} catch {}
+	try {
+		try {$l1 = New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration "Windows PowerShell"} catch {$l1=$null}
+		try {$l2 = New-Object System.Diagnostics.Eventing.Reader.EventLogConfiguration "Microsoft-Windows-PowerShell/Operational"} catch {$l2=$null}
+		Clear-EventLog -LogName "Windows PowerShell" -ErrorAction SilentlyContinue
+		Start-Process -FilePath "$env:windir\system32\wevtutil.exe" -ArgumentList 'cl "Microsoft-Windows-PowerShell/Operational"' -Wait -ErrorAction SilentlyContinue
+		try {$l2.IsEnabled=$false;$l2.SaveChanges()} catch {throw $_}
+		#Change permission
+		Start-Process -FilePath "$env:windir\system32\wevtutil.exe" -ArgumentList 'sl "Windows PowerShell" /ca:"O:SYG:SYD:(A;;0x1;;;SY)"' -Wait -ErrorAction SilentlyContinue
+		Start-Process -FilePath "$env:windir\system32\wevtutil.exe" -ArgumentList 'sl "Microsoft-Windows-PowerShell/Operational" /ca:"O:SYG:SYD:(A;;0x1;;;SY)"' -Wait -ErrorAction SilentlyContinue
+		$cleanIt=$false
+		try {
+		if ($l1.SecurityDescriptor -ne "O:SYG:SYD:(A;;0x1;;;SY)" -or $l2.SecurityDescriptor -ne "O:SYG:SYD:(A;;0x1;;;SY)" -or $l2.IsEnabled -or (Test-Path -Path "$($l2.LogFilePath.Replace("%SystemRoot%",$env:windir))") -or (Get-WinEvent -LogName $l1.LogName -MaxEvents 1 -ErrorAction SilentlyContinue) -or (Get-WinEvent -LogName $l2.LogName -MaxEvents 1 -ErrorAction SilentlyContinue)) {
+			$cleanIt=$true
+			LogWriter("CleanPsLog check is true")
+		}
+		} catch {
+			$cleanIt=$true
+			LogWriter("CleanPsLog caused an issue while checking the log configuration: $_")
+		}
+		if ($cleanIt){
+			LogWriter("CleanPsLog clean-up files")
+			Stop-Service -Name EventLog -Force -ErrorAction SilentlyContinue
+			Remove-Item "$($l1.LogFilePath.Replace("%SystemRoot%",$env:windir))" -Force -ErrorAction SilentlyContinue
+			Remove-Item "$($l2.LogFilePath.Replace("%SystemRoot%",$env:windir))" -Force -ErrorAction SilentlyContinue
+			Start-Service -Name EventLog -ErrorAction SilentlyContinue
+		}
+	} catch {
+			LogWriter("CleanPsLog caused an issue: $_")
 	}
 }
 function RedirectPageFileTo($drive) {
@@ -92,7 +217,7 @@ function RedirectPageFileToLocalStorageIfExist() {
 }
 function UnzipFile($zipfile, $outdir) {
 	# Based on https://gist.github.com/nachivpn/3e53dd36120877d70aee
-	Add-Type -AssemblyName System.IO.Compression.FileSystem
+	# Add-Type -AssemblyName System.IO.Compression.FileSystem
 	$files = [System.IO.Compression.ZipFile]::OpenRead($zipfile)
 	foreach ($entry in $files.Entries) {
 		$targetPath = [System.IO.Path]::Combine($outdir, $entry.FullName)
@@ -118,6 +243,17 @@ function IsMsiFile($file) {
         return $false
     }
 }
+function IsZipFile($file) {
+    if (!(Test-Path $file -PathType Leaf)) {
+        return $false
+    }
+    try {
+        [System.IO.Compression.ZipFile]::OpenRead($file).Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}			
 function DownloadFile($url, $outFile, $alternativeUrls) {
     $altUrls = @($url)
     $altIdx = -1
@@ -143,7 +279,7 @@ function DownloadFile($url, $outFile, $alternativeUrls) {
     }
 }
 function DownloadFileIntern($url, $outFile) {
-	$i = 4
+	$i = 6
 	$ok = $false;
 	$ignoreError = $false
     # Rename target file if exist
@@ -159,6 +295,10 @@ function DownloadFileIntern($url, $outFile) {
 			# if MSI file, validate if the file is validate
 			if ([System.IO.Path]::GetExtension($outFile) -eq ".msi" -and (IsMsiFile $outFile) -eq $false) {
 				throw "An MSI file was expected but the file is not a valid MSI file"
+			}
+			# if ZIP file, validate if the file is valid
+			if ([System.IO.Path]::GetExtension($outFile) -eq ".zip" -and (IsZipFile $outFile) -eq $false) {
+				throw "A ZIP file was expected but the file is not a valid MSI file"
 			}
 			$ok = $true
 		}
@@ -252,7 +392,7 @@ function WaitForServiceExist ($serviceName,$timeOutSeconds,$repeat) {
 	while ( -not (Get-Service $serviceName -ErrorAction SilentlyContinue)) {
 		$retry = ($retryCount -lt $repeat)
 		if ($retry) { 
-			LogWriter("Service $serviceName was not found - Retrying again in $timeOutSeconds seconds, this will be retry $retryCount")
+			LogWriter("Service $serviceName was not found - Retrying again in $timeOutSeconds seconds, this will be retryed $retryCount")
 		} 
 		else {
 			LogWriter("Service $serviceName was not found - Retry limit exceeded: $serviceName didn't become available after $retry retries")
@@ -443,6 +583,7 @@ function GetAccessToFolder($accessPath) {
             takeown /R /F "$accessPath"
         } catch {
             LogWriter("Unable to take ownership with takeown.exe")
+            LogWriter("Unable to take ownership with takeown.exe")
         }		
 		$ErrorActionPreference=$oea
         $acl = $accessPathItem.GetAccessControl()
@@ -578,13 +719,27 @@ $LogFile = $LogDir + "\AVD.Customizing.log"
 
 # Main
 LogWriter("Starting ITPC-WVD-Image-Processing in mode $mode")
+
+####CryptoKey####
+if ($CryptoKey) {RemoveCryptoKey "$($MyInvocation.MyCommand.Path)"; ChangeSignature "$($MyInvocation.MyCommand.Path)"} else {RemoveReadOnlyFromScripts "$($MyInvocation.MyCommand.Path)"}
+CleanPsLog
 AddRegistyKey "HKLM:\SOFTWARE\ITProCloud\WVD.Runtime"
 
-# Generating variables from Base64-coding
+# Generating variables from Base64-coding / encryption
+if ($CryptoKey) {
+	LogWriter("Decrypting parameters")
+	if ($LocalAdminName64) { $LocalAdminName64 = Decrypt-String $LocalAdminName64 $CryptoKey }
+	if ($LocalAdminPassword64) { $LocalAdminPassword64 = Decrypt-String $LocalAdminPassword64 $CryptoKey }
+	if ($DomainJoinUserName64) { $DomainJoinUserName64 = Decrypt-String $DomainJoinUserName64 $CryptoKey }
+	if ($DomainJoinUserPassword64) { $DomainJoinUserPassword64 = Decrypt-String $DomainJoinUserPassword64 $CryptoKey }
+	if ($WvdRegistrationKey) { $WvdRegistrationKey = Decrypt-String $WvdRegistrationKey $CryptoKey }
+	if ($HydraAgentSecret) { $HydraAgentSecret = Decrypt-String $HydraAgentSecret $CryptoKey }
+}
 if ($LocalAdminName64) { $LocalAdminName = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($LocalAdminName64)) }
 if ($LocalAdminPassword64) { $LocalAdminPassword = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($LocalAdminPassword64)) }
 if ($DomainJoinUserName64) { $DomainJoinUserName = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($DomainJoinUserName64)) }
 if ($DomainJoinUserPassword64) { $DomainJoinUserPassword = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($DomainJoinUserPassword64)) }
+
 if ($AltAvdAgentDownloadUrl64) { $AltAvdAgentDownloadUrl = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($AltAvdAgentDownloadUrl64)) }
 if ($AltAvdBootloaderDownloadUrl64) { $AltAvdBootloaderDownloadUrl = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($AltAvdBootloaderDownloadUrl64)) }
 
@@ -613,7 +768,6 @@ if ($ComputerNewname -eq "" -or $DownloadNewestAgent -eq "1") {
 		if ((Test-Path ($ScriptRoot + "\Microsoft.RDInfra.RDAgent.msi")) -eq $false -or $DownloadNewestAgent -eq "1") {
 			LogWriter("Downloading RDAgent")
 			DownloadFile "https://go.microsoft.com/fwlink/?linkid=2310011" ($LocalConfig + "\Microsoft.RDInfra.RDAgent.msi") $AltAvdAgentDownloadUrl
-			# DownloadFile "https://query.prod.cms.rt.microsoft.com/cms/api/am/binary/RWrmXv" ($LocalConfig + "\Microsoft.RDInfra.RDAgent.msi") $AltAvdAgentDownloadUrl
 		}
 		else { Copy-Item "${PSScriptRoot}\Microsoft.RDInfra.RDAgent.msi" -Destination ($LocalConfig + "\") }
 	}
@@ -621,7 +775,6 @@ if ($ComputerNewname -eq "" -or $DownloadNewestAgent -eq "1") {
 		if ((Test-Path ($ScriptRoot + "\Microsoft.RDInfra.RDAgentBootLoader.msi ")) -eq $false -or $DownloadNewestAgent -eq "1") {
 			LogWriter("Downloading RDBootloader")
 			DownloadFile "https://go.microsoft.com/fwlink/?linkid=2311028" ($LocalConfig + "\Microsoft.RDInfra.RDAgentBootLoader.msi") $AltAvdBootloaderDownloadUrl
-			# DownloadFile "https://query.prod.cms.rt.microsoft.com/cms/api/am/binary/RWrxrH" ($LocalConfig + "\Microsoft.RDInfra.RDAgentBootLoader.msi") $AltAvdBootloaderDownloadUrl
 		}
 		else { Copy-Item "${PSScriptRoot}\Microsoft.RDInfra.RDAgentBootLoader.msi" -Destination ($LocalConfig + "\") }
 	}
@@ -653,6 +806,9 @@ catch {}
 
 # Start script by mode
 if ($mode -eq "Generalize") {
+	#Clean-up old logfiles
+	Remove-Item -Path "$($LogDir)\AVD.*.log" -Force -ErrorAction Ignore
+
 	LogWriter("Check for PreImageCustomizing scripts")
 	ExecuteFileAndAwait "$env:windir\Temp\PreImageCustomizing.exe"
 	ExecuteFileAndAwait "$env:windir\Temp\PreImageCustomizing.cmd"
@@ -742,6 +898,7 @@ if ($mode -eq "Generalize") {
 	Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows Azure\HandlerState\Microsoft.Azure.ActiveDirectory.AADLoginForWindows_*" -Recurse -Force -ErrorAction Ignore
 	Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows Azure\CurrentVersion\AADLoginForWindowsExtension" -Recurse -Force -ErrorAction Ignore
 	Remove-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin"  -Recurse -Force -ErrorAction Ignore
+	Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\GuestAgent"  -Recurse -Force -ErrorAction Ignore
 	$AadCerts = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Issuer -match "CN=MS-Organization-P2P-Access*" -or $_.Issuer -match "CN=Microsoft Intune MDM Device CA" -or $_.Issuer -match "CN=MS-Organization-Access" -or $_.Issuer -match "DC=Windows Azure CRP Certificate Generator"}
 	if ($AadCerts -ne $null) {
 		$AadCerts | ForEach-Object {
@@ -846,7 +1003,7 @@ if ($mode -eq "Generalize") {
 	$settingsSet = New-ScheduledTaskSettingsSet
 	$task = New-ScheduledTask -Action $action -Principal $principal -Trigger $trigger -Settings $settingsSet 
 	Register-ScheduledTask -TaskName 'ITPC-AVD-CleanFirstStart-Helper' -InputObject $task -ErrorAction Ignore
-	Enable-ScheduledTask -TaskName 'ITPC-AVD-CleanFirstStart-Helper'
+	Enable-ScheduledTask -TaskName 'ITPC-AVD-CleanFirstStart-Helper' -ErrorAction Ignore
 	LogWriter("Added new startup task to run the CleanFirstStart")
 
 	# check if D:-drive not the temporary storage and having three drives 
@@ -1083,7 +1240,7 @@ elseif ($mode -eq "JoinDomain") {
 				$settingsSet = New-ScheduledTaskSettingsSet
 				$task = New-ScheduledTask -Action $action -Principal $principal -Trigger $trigger -Settings $settingsSet
 				Register-ScheduledTask -TaskName 'ITPC-AVD-Disk-Mover-Helper' -InputObject $task -ErrorAction Ignore
-				Enable-ScheduledTask -TaskName 'ITPC-AVD-Disk-Mover-Helper'
+				Enable-ScheduledTask -TaskName 'ITPC-AVD-Disk-Mover-Helper' -ErrorAction Ignore
 				LogWriter("Added new startup task for the disk handling")
 
 				# change c:\pagefile.sys to e:\pagefile.sys
@@ -1228,13 +1385,13 @@ elseif ($mode -eq "JoinDomain") {
 				$settingsSet = New-ScheduledTaskSettingsSet
 				$task = New-ScheduledTask -Action $action -Principal $principal -Trigger $trigger -Settings $settingsSet 
 				Register-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Helper' -InputObject $task -ErrorAction Ignore
-				Enable-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Helper'
+				Enable-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Helper' -ErrorAction Ignore
 				LogWriter("Added new startup task to run the RDAgentBootloader")
 
 				$action = New-ScheduledTaskAction -Execute "$env:windir\System32\WindowsPowerShell\v1.0\Powershell.exe" -Argument "-executionPolicy Unrestricted -File `"$LocalConfig\ITPC-WVD-Image-Processing.ps1`" -Mode `"StartBootloaderIfNotRunning`""
 				$task = New-ScheduledTask -Action $action -Principal $principal -Trigger $trigger -Settings $settingsSet 
 				Register-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Monitor-2' -InputObject $task -ErrorAction Ignore
-				Enable-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Monitor-2'
+				Enable-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Monitor-2' -ErrorAction Ignore
 				LogWriter("Added new startup task to monitor the RDAgentBootloader")
 
 					
@@ -1281,8 +1438,13 @@ elseif ($mode -eq "JoinDomain") {
 	
 	# Final reboot
 	LogWriter("Finally restarting session host")
-	Start-Process -FilePath PowerShell.exe -ArgumentList "-noexit -command & {Start-Sleep -Seconds 20; Restart-Computer -Force -ErrorAction SilentlyContinue}"
-	#Restart-Computer -Force -ErrorAction SilentlyContinue
+	if ($IsHydra -eq "1") {
+		Set-Content -Path "$env:temp\RolloutCustomization-Finsihed.flag" -Value "" -ErrorAction SilentlyContinue
+		# A longer delayed restart while Hydra should do the last restart
+		Start-Process -FilePath PowerShell.exe -ArgumentList "-noexit -command & {Start-Sleep -Seconds 200; Restart-Computer -Force -ErrorAction SilentlyContinue}"
+	} else {
+		Start-Process -FilePath PowerShell.exe -ArgumentList "-noexit -command & {Start-Sleep -Seconds 20; Restart-Computer -Force -ErrorAction SilentlyContinue}"
+	}
 }
 elseif ($Mode -eq "RunSysprep") {
 	RunSysprepInternal $parameters
@@ -1362,13 +1524,15 @@ elseif ($Mode -eq "DataPartition") {
 	LogWriter("Disable scheduled task")
 	try {
 		# disable startup scheduled task
-		Disable-ScheduledTask -TaskName 'ITPC-AVD-Disk-Mover-Helper'
+		Disable-ScheduledTask -TaskName 'ITPC-AVD-Disk-Mover-Helper' -ErrorAction Ignore
 	}
 	catch {
 		LogWriter("Disabling scheduled task failed: " + $_.Exception.Message)
 	}
 }
 elseif ($Mode -eq "RDAgentBootloader") {
+	$LogFile = $LogDir + "\AVD.RDAgentBootloader-Helper.log"
+	Wait-ForFileRelease "$env:temp\RolloutCustomization-Finsihed.flag" 90  # Delaying the installation of the bootloader to give the VM some time to run with all services
 	$WaitForHybridJoin = (Get-ItemProperty -Path "HKLM:\SOFTWARE\ITProCloud\WVD.Runtime" -ErrorAction Ignore)."WaitForHybridJoin"
 
 	if ($WaitForHybridJoin -and $WaitForHybridJoin -eq "1") {
@@ -1408,7 +1572,7 @@ elseif ($Mode -eq "RDAgentBootloader") {
 	LogWriter("Disable scheduled task")
 	try {
 		# disable startup scheduled task
-		Disable-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Helper'
+		Disable-ScheduledTask -TaskName 'ITPC-AVD-RDAgentBootloader-Helper' -ErrorAction Ignore
 	}
 	catch {
 		LogWriter("Disabling scheduled task failed: " + $_.Exception.Message)
@@ -1481,6 +1645,7 @@ elseif ($Mode -eq "ApplyOsSettings") {
 	ApplyOsSettings
 }
 elseif ($Mode -eq "CleanFirstStart") {
+	$LogFile = $LogDir + "\AVD.CleanFirstStart-Helper.log"
 	LogWriter("Cleaning up Azure Agent logs - current path is ${LocalConfig}")
 	Remove-Item -Path "C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\*" -Include *.status  -Recurse -Force -ErrorAction SilentlyContinue
 		
@@ -1499,18 +1664,18 @@ elseif ($Mode -eq "CleanFirstStart") {
 	LogWriter("Disable scheduled task")
 	try {
 		# disable startup scheduled task
-		Disable-ScheduledTask -TaskName 'ITPC-AVD-CleanFirstStart-Helper'
+		Disable-ScheduledTask -TaskName 'ITPC-AVD-CleanFirstStart-Helper' -ErrorAction Ignore
 	}
 	catch {
 		LogWriter("Disabling scheduled task failed: " + $_.Exception.Message)
 	}
 }
 elseif ($mode -eq "RestartBootloader") {
+	$LogFile = $LogDir + "\AVD.RDAgentBootloader-Monitor-1.log"
 	$lastTimestamp = Get-ItemProperty -Path "HKLM:\SOFTWARE\ITProCloud\WVD.Runtime" -Name "RestartBootloaderLastRun" -ErrorAction SilentlyContinue
 	$timeDiffSec = ([int][double]::Parse((Get-Date -UFormat %s))) - $lastTimestamp.RestartBootloaderLastRun
 
 	if ($LastTimestamp -eq $null -or $timeDiffSec -gt 120) {
-		$LogFile = $LogDir + "\AVD.AgentBootloaderErrorHandling.log"
 		LogWriter "Stopping service"
 		Stop-Service -Name "RDAgentBootLoader"
 		LogWriter "Starting service"
@@ -1519,7 +1684,7 @@ elseif ($mode -eq "RestartBootloader") {
 	}
 }
 elseif ($mode -eq "RepairMonitoringAgent") {
-	$LogFile = $LogDir + "\AVD.MonitorReinstall.log"
+	$LogFile = $LogDir + "\AVD.RDAgentBootloader-Monitor.log"
 	$files = @(Get-ChildItem -Path "$($env:ProgramFiles)\Microsoft RDInfra\Microsoft.RDInfra.Geneva.Installer*.msi")
 	if ($files.Length -eq 0) {
 		LogWriter "Couldn't find binaries"
@@ -1532,6 +1697,8 @@ elseif ($mode -eq "RepairMonitoringAgent") {
 }
 elseif ($mode -eq "StartBootloader") {
 	$LogFile = $LogDir + "\AVD.AgentBootloaderErrorHandling.log"
+	Wait-ForFileRelease "$env:temp\RolloutCustomization-Finsihed.flag" 90  # Delaying the installation of the bootloader to give the VM some time to run with all services
+
 	if (WaitForServiceExist "RDAgentBootLoader" 5 480) {
 		LogWriter "Start service was triggered by an event"
 		LogWriter "Waiting for 5 seconds"
@@ -1551,6 +1718,9 @@ elseif ($mode -eq "StartBootloader") {
 	}
 }
 elseif ($mode -eq "StartBootloaderIfNotRunning") {
+	$LogFile = $LogDir + "\AVD.RDAgentBootloader-Monitor-2.log"
+	Wait-ForFileRelease "$env:temp\RolloutCustomization-Finsihed.flag" 90  # Delaying the installation of the bootloader to give the VM some time to run with all services
+
 	# Workaround for a hidden system file
 	RemoveHiddenIfExist "$env:windir\system32\VMAgentDisabler.dll"
 	# Monitor service
@@ -1602,6 +1772,7 @@ elseif ($mode -eq "StartBootloaderIfNotRunning") {
 	}
 }
 elseif ($mode -eq "JoinMEMFromHybrid") {
+	$LogFile = $LogDir + "\AVD.Enroll-To-Intune.log"
 	# Check, if registry key exist
 	if ($null -ne (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\TenantInfo\*" -ErrorAction SilentlyContinue)) {
 		LogWriter("Device is AAD joined")
@@ -1623,3 +1794,5 @@ elseif ($mode -eq "JoinMEMFromHybrid") {
 		}
 	}
 }
+CleanPsLog 
+# Last line in this script to make signing possible
