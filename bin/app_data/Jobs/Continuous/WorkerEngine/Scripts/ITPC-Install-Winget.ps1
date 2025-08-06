@@ -1,5 +1,5 @@
 ﻿# This powershell script is part of Hydra
-# Current Version of this script: 2.2
+# Current Version of this script: 2.3
 
 param(
 	[Parameter(Mandatory)]
@@ -27,6 +27,18 @@ function DownloadFile ($url, $outFile) {
             Start-Sleep -Seconds 10
         }
     } while (!$ok)
+}
+function RemoveReadOnlyFromScripts($path){
+    try {
+		if ($path -like 'C:\Packages\Plugins\*\Downloads\*') {
+			$dir  = Split-Path $path -Parent
+			Get-ChildItem $dir -Filter 'script*.ps1' -File | ForEach-Object {
+				if ($_.Attributes -band 'ReadOnly') { $_.Attributes = $_.Attributes -bxor 'ReadOnly' }
+			}
+		}
+    } catch {
+        LogWriter("Remove ReadOnly from scripts caused an issue: $_")
+    }
 }
 
 # Source: https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md
@@ -228,6 +240,7 @@ $wgetErrorCodes = @{
 }
 
 LogWriter("Microsoft Package Manager Installer")
+RemoveReadOnlyFromScripts "$($MyInvocation.MyCommand.Path)"
 
 $startTimeString=(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHHmmss")
 
